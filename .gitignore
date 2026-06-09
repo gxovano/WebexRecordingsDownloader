@@ -1,2 +1,5 @@
 node_modules/
 .ruff_cache/
+__pycache__/
+.venv/
+recordings.csv

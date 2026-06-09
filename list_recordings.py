@@ -22,16 +22,28 @@ def token_refresh():
             break
     return newToken
 
+CSV_COLUMNS = ('recordingId', 'hostEmail', 'topic', 'timeRecorded', 'createTime', 'durationSeconds')
+
+def ensureCsvHeader(path):
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        with open(path, 'w', newline='') as writeRecordings:
+            writer = csv.writer(writeRecordings, delimiter=',')
+            writer.writerow(CSV_COLUMNS)
+
 def storeRecordings(items):
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'recordings.csv')
+    ensureCsvHeader(path)
     for id in items:
         recordId = id['id']
         hostEmail = id['hostEmail']
-        print(recordId, hostEmail)
-        path = os.path.dirname(os.path.abspath(__file__))
-        name = os.path.join(path, 'recordings.csv')
-        with open (name, 'a', newline='') as writeRecordings:
+        topic = id.get('topic', '')
+        timeRecorded = id.get('timeRecorded', '')
+        createTime = id.get('createTime', '')
+        durationSeconds = id.get('durationSeconds', '')
+        print(recordId, hostEmail, topic, timeRecorded)
+        with open(path, 'a', newline='') as writeRecordings:
             writer = csv.writer(writeRecordings, delimiter=',')
-            writer.writerow((recordId, hostEmail))
+            writer.writerow((recordId, hostEmail, topic, timeRecorded, createTime, durationSeconds))
 
 def list(headers, site_url, weeks):
     to_time = datetime.datetime.now().replace(microsecond=0)
