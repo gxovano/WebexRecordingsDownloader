@@ -30,11 +30,26 @@ def ensureCsvHeader(path):
             writer = csv.writer(writeRecordings, delimiter=',')
             writer.writerow(CSV_COLUMNS)
 
+def load_existing_recording_ids(path):
+    ids = set()
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return ids
+    with open(path, 'r', newline='') as csvfile:
+        reader = csv.reader(csvfile)
+        for row in reader:
+            if row and row[0] != 'recordingId':
+                ids.add(row[0])
+    return ids
+
 def storeRecordings(items):
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'recordings.csv')
     ensureCsvHeader(path)
+    existing_ids = load_existing_recording_ids(path)
     for id in items:
         recordId = id['id']
+        if recordId in existing_ids:
+            continue
+        existing_ids.add(recordId)
         hostEmail = id['hostEmail']
         topic = id.get('topic', '')
         timeRecorded = id.get('timeRecorded', '')

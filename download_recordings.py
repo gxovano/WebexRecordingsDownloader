@@ -58,7 +58,7 @@ def get_workers_per_disk_from_env():
 
 
 def empty_state():
-    return {"version": STATE_VERSION, "completed": {}, "failed": {}}
+    return {"version": STATE_VERSION, "completed": {}, "failed": {}, "in_progress": {}}
 
 
 class DownloadState:
@@ -92,6 +92,22 @@ class DownloadState:
         with self._locked() as data:
             return recording_id in data["completed"]
 
+    def try_claim(self, recording_id):
+        with self._locked() as data:
+            if recording_id in data["completed"]:
+                return False
+            in_progress = data.setdefault("in_progress", {})
+            if recording_id in in_progress:
+                return False
+            in_progress[recording_id] = {
+                "claimed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }
+            return True
+
+    def release_claim(self, recording_id):
+        with self._locked() as data:
+            data.setdefault("in_progress", {}).pop(recording_id, None)
+
     def mark_completed(self, recording_id, target_path):
         with self._locked() as data:
             data["completed"][recording_id] = {
@@ -99,6 +115,7 @@ class DownloadState:
                 "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             }
             data["failed"].pop(recording_id, None)
+            data.setdefault("in_progress", {}).pop(recording_id, None)
 
     def mark_failed(self, recording_id, error):
         with self._locked() as data:
@@ -106,6 +123,7 @@ class DownloadState:
                 "error": str(error),
                 "failed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             }
+            data.setdefault("in_progress", {}).pop(recording_id, None)
 
     def remove_completed(self, recording_id):
         with self._locked() as data:
@@ -135,36 +153,30 @@ def resolve_download_dir(host_email, download_dirs, disk_index=None):
     return os.path.join(base_dir, safe_account_dir(host_email))
 
 
-def buildRecordingFileName(topic, timeRecorded, originalFileName, recordingId, download_dir):
-    _, ext = os.path.splitext(originalFileName)
-    if not ext:
-        ext = '.mp4'
+def recording_file_extension(original_file_name):
+    _, ext = os.path.splitext(original_file_name or '')
+    return ext or '.mp4'
 
-    if not topic and not timeRecorded:
-        return originalFileName
 
-    safeTopic = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', topic or 'recording')
-    safeTopic = re.sub(r'\s+', ' ', safeTopic).strip()[:120] or 'recording'
+def recording_file_path(recording_id, original_file_name, account_dir):
+    ext = recording_file_extension(original_file_name)
+    return os.path.join(account_dir, f"{recording_id}{ext}")
 
-    timestamp = ''
-    if timeRecorded:
-        try:
-            dt = datetime.datetime.fromisoformat(timeRecorded.replace('Z', '+00:00'))
-            timestamp = dt.strftime('%Y-%m-%d_%H-%M-%S')
-        except ValueError:
-            timestamp = re.sub(r'[<>:"/\\|?*]', '', timeRecorded)[:19]
 
-    parts = [safeTopic]
-    if timestamp:
-        parts.append(timestamp)
-    baseName = '_'.join(parts)
-    fileName = baseName + ext
+def is_usable_file(path):
+    return bool(path) and os.path.isfile(path) and os.path.getsize(path) > 0
 
-    targetPath = os.path.join(download_dir, fileName)
-    if os.path.exists(targetPath):
-        fileName = f"{baseName}_{recordingId[:8]}{ext}"
 
-    return fileName
+def resolve_recording_paths(recording_id, original_file_name, account_dir, state_data):
+    target_path = recording_file_path(recording_id, original_file_name, account_dir)
+    completed = state_data.get("completed", {})
+
+    stored_path = completed.get(recording_id, {}).get("path", "")
+    if is_usable_file(stored_path):
+        return stored_path, stored_path
+    if is_usable_file(target_path):
+        return target_path, target_path
+    return None, target_path
 
 
 def refresh_headers_if_needed(response, headers):
@@ -203,12 +215,21 @@ def should_process_row(host_email, disk_index, disk_count, worker_index=None, wo
 
 def load_recording_rows(csv_path):
     rows = []
+    seen_ids = set()
+    duplicate_count = 0
     with open(csv_path, 'r', newline='') as csvfile:
         reader = csv.reader(csvfile)
         for row in reader:
             if not row or row[0] == 'recordingId':
                 continue
+            recording_id = row[0]
+            if recording_id in seen_ids:
+                duplicate_count += 1
+                continue
+            seen_ids.add(recording_id)
             rows.append(row)
+    if duplicate_count:
+        print(f"Aviso: {duplicate_count} entradas duplicadas ignoradas no CSV (mesmo recordingId).")
     return rows
 
 
@@ -257,13 +278,23 @@ def show_download_status(rows, download_dirs, state_path):
         print(f"Concluidas no estado mas ausentes do CSV atual: {len(stale_completed)}")
 
 
-def save_recording_file(content, target_path):
+DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+
+
+def stream_recording_file(response, target_path, chunk_size=DOWNLOAD_CHUNK_SIZE):
     part_path = f"{target_path}.part"
     if os.path.exists(part_path):
         os.remove(part_path)
-    with open(part_path, 'wb') as file:
-        file.write(content)
-    os.replace(part_path, target_path)
+    try:
+        with open(part_path, 'wb') as file:
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    file.write(chunk)
+        os.replace(part_path, target_path)
+    except Exception:
+        if os.path.exists(part_path):
+            os.remove(part_path)
+        raise
 
 
 def getDownloadLinks(
@@ -311,6 +342,10 @@ def getDownloadLinks(
             print(f"Ja concluida no estado, pulando: {recording_id}")
             continue
 
+        if not state.try_claim(recording_id):
+            print(f"Gravacao em andamento ou concluida por outro worker, pulando: {recording_id}")
+            continue
+
         host_email = host_email_raw.replace('@', '%40').replace('+', '%2B')
         topic = row[2] if len(row) > 2 else ''
         time_recorded = row[3] if len(row) > 3 else ''
@@ -342,32 +377,40 @@ def getDownloadLinks(
             continue
 
         try:
-            recording = requests.get(recording_download_link)
-            if recording.status_code == 200:
-                content_disposition = recording.headers.get('Content-Disposition', '')
-                if "''" in content_disposition:
-                    file_name = content_disposition.split("''")[1]
-                else:
-                    file_name = f"{recording_id}.mp4"
-                save_as = buildRecordingFileName(topic, time_recorded, file_name, recording_id, account_dir)
-                target_path = os.path.join(account_dir, save_as)
-                if skip_existing and os.path.exists(target_path):
-                    print(f"Arquivo ja existe, registrando como concluida: {target_path}")
+            with requests.get(recording_download_link, stream=True) as recording:
+                if recording.status_code == 200:
+                    content_disposition = recording.headers.get('Content-Disposition', '')
+                    if "''" in content_disposition:
+                        file_name = content_disposition.split("''")[1]
+                    else:
+                        file_name = f"{recording_id}.mp4"
+                    existing_path, target_path = resolve_recording_paths(
+                        recording_id,
+                        file_name,
+                        account_dir,
+                        state.load(),
+                    )
+                    if skip_existing and existing_path:
+                        print(f"Arquivo ja existe, registrando como concluida: {existing_path}")
+                        state.mark_completed(recording_id, existing_path)
+                        continue
+                    save_as = os.path.basename(target_path)
+                    print(f"Filename: {save_as}")
+                    stream_recording_file(recording, target_path)
                     state.mark_completed(recording_id, target_path)
+                    print(f"{save_as} saved!")
+                elif recording.status_code == 429:
+                    retry_after = recording.headers.get("retry-after") or recording.headers.get("Retry-After")
+                    print(f"Rate limited. Waiting {retry_after} seconds.")
+                    state.release_claim(recording_id)
+                    time.sleep(int(retry_after))
                     continue
-                print(f"Filename: {save_as}")
-                save_recording_file(recording.content, target_path)
-                state.mark_completed(recording_id, target_path)
-                print(f"{save_as} saved!")
-            elif recording.status_code == 429:
-                retry_after = recording.headers.get("retry-after") or recording.headers.get("Retry-After")
-                print(f"Rate limited. Waiting {retry_after} seconds.")
-                time.sleep(int(retry_after))
-            else:
-                error = f"Download falhou com status {recording.status_code}"
-                print("Unable to download, something went wrong!")
-                print(f"Status Code: {recording.status_code}")
-                state.mark_failed(recording_id, error)
+                else:
+                    error = f"Download falhou com status {recording.status_code}"
+                    print("Unable to download, something went wrong!")
+                    print(f"Status Code: {recording.status_code}")
+                    state.mark_failed(recording_id, error)
+                    continue
         except Exception as e:
             print(e)
             state.mark_failed(recording_id, e)
