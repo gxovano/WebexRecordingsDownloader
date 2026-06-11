@@ -3,3 +3,5 @@ node_modules/
 __pycache__/
 .venv/
 recordings.csv
+download_state.json
+download-disk*.log
