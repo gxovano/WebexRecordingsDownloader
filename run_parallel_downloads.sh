@@ -4,18 +4,29 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-CSV_PATH="${RECORDINGS_CSV:-../recordings.csv}"
+SOURCE_CSV="${RECORDINGS_CSV:-../recordings.csv}"
 DOWNLOAD_DIRS="${DOWNLOAD_DIRS:-/mnt/disco1/WebexRecordings,/mnt/disco2/WebexRecordings,/mnt/disco3/WebexRecordings}"
 WORKERS_PER_DISK="${WORKERS_PER_DISK:-1}"
-STATE_FILE="${DOWNLOAD_STATE:-$SCRIPT_DIR/download_state.json}"
+DISK_MIN_FREE_MB="${DISK_MIN_FREE_MB:-5120}"
+DISK_SPACE_WAIT_SEC="${DISK_SPACE_WAIT_SEC:-60}"
 MAX_WORKER_RESTARTS="${MAX_WORKER_RESTARTS:-5}"
 RESTART_DELAY_SEC="${RESTART_DELAY_SEC:-15}"
 POLL_INTERVAL_SEC="${POLL_INTERVAL_SEC:-5}"
 MEM_RESERVE_MB="${MEM_RESERVE_MB:-2048}"
 MEM_PER_WORKER_MB="${MEM_PER_WORKER_MB:-400}"
 AUTO_WORKERS="${AUTO_WORKERS:-0}"
+RUN_PREPARE="${RUN_PREPARE:-1}"
+RECORDINGS_DATE="${RECORDINGS_DATE:-$(date +%Y%m%d)}"
+OUTPUT_DIR="${PREPARE_OUTPUT_DIR:-$SCRIPT_DIR}"
 
 PYTHON="${PYTHON:-python3}"
+DOWNLOADER="download_recordings_v2.py"
+
+if grep -q 'buildRecordingFileName' "$SCRIPT_DIR/$DOWNLOADER" 2>/dev/null; then
+  echo "ERRO: $DOWNLOADER desatualizado (contem buildRecordingFileName)."
+  echo "       Atualize o codigo antes de continuar para evitar nomes legados e duplicatas."
+  exit 1
+fi
 
 IFS=',' read -r -a DISKS <<< "$DOWNLOAD_DIRS"
 DISK_COUNT="${#DISKS[@]}"
@@ -80,23 +91,52 @@ is_killed_exit_code() {
   (( code == 137 || code == 143 || code == 9 ))
 }
 
+csv_has_data_rows() {
+  local csv_file=$1
+  [[ -f "$csv_file" ]] || return 1
+  local lines
+  lines=$(wc -l < "$csv_file")
+  (( lines > 1 ))
+}
+
+disk_csv_path() {
+  local disk=$1
+  echo "$OUTPUT_DIR/recordings_${RECORDINGS_DATE}_disco${disk}.csv"
+}
+
+disk_state_path() {
+  local disk=$1
+  if [[ -n "${DOWNLOAD_STATE:-}" ]]; then
+    printf '%s\n' "${DOWNLOAD_STATE//\{disk\}/$disk}"
+    return
+  fi
+  echo "$SCRIPT_DIR/download_state_disco${disk}.json"
+}
+
 start_worker() {
   local disk=$1
   local worker=$2
   local key="${disk}-${worker}"
   local log_file="download-disk${disk}-worker${worker}.log"
+  local csv_file
+  csv_file=$(disk_csv_path "$disk")
 
-  "$PYTHON" download_recordings.py \
-    --csv "$CSV_PATH" \
+  if ! csv_has_data_rows "$csv_file"; then
+    echo "Worker disco $disk / worker $worker ignorado: CSV vazio ou ausente ($csv_file)"
+    return 0
+  fi
+
+  "$PYTHON" "$DOWNLOADER" \
+    --csv "$csv_file" \
     --dirs "$DOWNLOAD_DIRS" \
     --disk-index "$disk" \
     --worker-index "$worker" \
     --workers-per-disk "$WORKERS_PER_DISK" \
-    --state-file "$STATE_FILE" \
+    --min-free-mb "$DISK_MIN_FREE_MB" \
     >> "$log_file" 2>&1 &
 
   WORKER_PID["$key"]=$!
-  echo "Worker disco $disk / worker $worker iniciado (PID ${WORKER_PID[$key]}, log: $log_file)"
+  echo "Worker disco $disk / worker $worker iniciado (PID ${WORKER_PID[$key]}, CSV: $csv_file, log: $log_file)"
 }
 
 reap_worker() {
@@ -131,32 +171,66 @@ reap_worker() {
   return 0
 }
 
-echo "CSV: $CSV_PATH"
+echo "CSV original: $SOURCE_CSV"
 echo "Discos: $DOWNLOAD_DIRS"
+
+if [[ "$RUN_PREPARE" == "1" ]]; then
+  echo "Preparando CSVs filtrados (RUN_PREPARE=1)..."
+  "$PYTHON" prepare_recordings.py \
+    --csv "$SOURCE_CSV" \
+    --dirs "$DOWNLOAD_DIRS" \
+    --output-dir "$OUTPUT_DIR" \
+    --date "$RECORDINGS_DATE"
+else
+  echo "RUN_PREPARE=0: usando CSVs existentes com data $RECORDINGS_DATE"
+fi
+
+PENDING_CSV="$OUTPUT_DIR/recordings_${RECORDINGS_DATE}.csv"
+echo "CSV pendentes: $PENDING_CSV"
+
 configure_workers_from_memory
 echo "Workers por disco: $WORKERS_PER_DISK"
-echo "Estado: $STATE_FILE"
+echo "Estado: um arquivo por disco (ex.: download_state_disco0.json)"
+if [[ -n "${DOWNLOAD_STATE:-}" ]]; then
+  echo "DOWNLOAD_STATE: $DOWNLOAD_STATE"
+fi
+echo "Espaco minimo livre por disco: ${DISK_MIN_FREE_MB} MB (aguarda ${DISK_SPACE_WAIT_SEC}s se insuficiente)"
 echo "Reinicios por worker (OOM): ate $MAX_WORKER_RESTARTS"
 
-"$PYTHON" download_recordings.py \
-  --csv "$CSV_PATH" \
-  --dirs "$DOWNLOAD_DIRS" \
-  --workers-per-disk "$WORKERS_PER_DISK" \
-  --state-file "$STATE_FILE" \
-  --show-distribution
+if csv_has_data_rows "$PENDING_CSV"; then
+  "$PYTHON" "$DOWNLOADER" \
+    --csv "$PENDING_CSV" \
+    --dirs "$DOWNLOAD_DIRS" \
+    --workers-per-disk "$WORKERS_PER_DISK" \
+    --min-free-mb "$DISK_MIN_FREE_MB" \
+    --show-distribution
 
-"$PYTHON" download_recordings.py \
-  --csv "$CSV_PATH" \
-  --dirs "$DOWNLOAD_DIRS" \
-  --state-file "$STATE_FILE" \
-  --show-status
+  "$PYTHON" "$DOWNLOADER" \
+    --csv "$PENDING_CSV" \
+    --dirs "$DOWNLOAD_DIRS" \
+    --min-free-mb "$DISK_MIN_FREE_MB" \
+    --show-status
+else
+  echo "Nenhuma gravacao pendente. Encerrando sem iniciar workers."
+  exit 0
+fi
 
 for ((disk=0; disk<DISK_COUNT; disk++)); do
   for ((worker=0; worker<WORKERS_PER_DISK; worker++)); do
-    start_worker "$disk" "$worker"
-    ACTIVE_WORKERS+=("${disk}-${worker}")
+    csv_file=$(disk_csv_path "$disk")
+    if csv_has_data_rows "$csv_file"; then
+      start_worker "$disk" "$worker"
+      ACTIVE_WORKERS+=("${disk}-${worker}")
+    else
+      echo "Disco $disk sem gravacoes pendentes ($csv_file)"
+    fi
   done
 done
+
+if ((${#ACTIVE_WORKERS[@]} == 0)); then
+  echo "Nenhum worker iniciado."
+  exit 0
+fi
 
 while ((${#ACTIVE_WORKERS[@]} > 0)); do
   STILL_RUNNING=()
@@ -179,8 +253,15 @@ done
 
 echo "Todos os workers finalizaram."
 
-"$PYTHON" download_recordings.py \
-  --csv "$CSV_PATH" \
+"$PYTHON" "$DOWNLOADER" \
+  --csv "$PENDING_CSV" \
   --dirs "$DOWNLOAD_DIRS" \
-  --state-file "$STATE_FILE" \
+  --min-free-mb "$DISK_MIN_FREE_MB" \
   --show-status
+
+for ((disk=0; disk<DISK_COUNT; disk++)); do
+  state_file=$(disk_state_path "$disk")
+  if [[ -f "$state_file" ]]; then
+    echo "Estado disco $disk: $state_file"
+  fi
+done

@@ -5,3 +5,10 @@ __pycache__/
 recordings.csv
 download_state.json
 download-disk*.log
+recordings.csv
+Downloaded-Recordings/
+download_state.json
+.venv/
+.cursor/
+__pycache__/
+tmp/
