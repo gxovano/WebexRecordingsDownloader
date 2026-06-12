@@ -14,6 +14,7 @@ import requests
 from dotenv import load_dotenv
 
 import list_recordings
+from recording_paths import canonical_recording_path, find_existing_recording_file, is_usable_file
 
 dotenv_path = Path('.env')
 load_dotenv(dotenv_path=dotenv_path)
@@ -159,23 +160,28 @@ def recording_file_extension(original_file_name):
 
 
 def recording_file_path(recording_id, original_file_name, account_dir):
-    ext = recording_file_extension(original_file_name)
-    return os.path.join(account_dir, f"{recording_id}{ext}")
+    return canonical_recording_path(recording_id, account_dir, original_file_name)
 
 
-def is_usable_file(path):
-    return bool(path) and os.path.isfile(path) and os.path.getsize(path) > 0
-
-
-def resolve_recording_paths(recording_id, original_file_name, account_dir, state_data):
+def resolve_recording_paths(
+    recording_id,
+    original_file_name,
+    account_dir,
+    state_data,
+    topic='',
+    time_recorded='',
+):
     target_path = recording_file_path(recording_id, original_file_name, account_dir)
-    completed = state_data.get("completed", {})
-
-    stored_path = completed.get(recording_id, {}).get("path", "")
-    if is_usable_file(stored_path):
-        return stored_path, stored_path
-    if is_usable_file(target_path):
-        return target_path, target_path
+    existing_path = find_existing_recording_file(
+        recording_id,
+        account_dir,
+        topic=topic,
+        time_recorded=time_recorded,
+        original_file_name=original_file_name,
+        state_data=state_data,
+    )
+    if existing_path:
+        return existing_path, target_path
     return None, target_path
 
 
@@ -389,6 +395,8 @@ def getDownloadLinks(
                         file_name,
                         account_dir,
                         state.load(),
+                        topic=topic,
+                        time_recorded=time_recorded,
                     )
                     if skip_existing and existing_path:
                         print(f"Arquivo ja existe, registrando como concluida: {existing_path}")
