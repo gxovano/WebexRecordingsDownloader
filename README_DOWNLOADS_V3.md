@@ -33,7 +33,7 @@ python download_recordings_v3.py \
 
 O script grava:
 
-- `download_state.json`: gravações concluídas, falhas e em andamento.
+- `download_state.json`: gravações concluídas, falhas, em andamento e links diretos já classificados como indisponíveis.
 - `download_availability_report.json`: resumo da pré-checagem, gravações disponíveis, indisponíveis e resultados dos downloads.
 
 ## Apenas verificar disponibilidade
@@ -59,8 +59,11 @@ python download_recordings_v3.py \
 --min-free-mb      Espaço livre mínimo antes/durante downloads. Padrão: DISK_MIN_FREE_MB ou 5120
 --no-skip-existing Reprocessa gravações já concluídas no estado ou encontradas no disco
 --check-only       Faz apenas a pré-checagem
+--recheck-unavailable Consulta novamente links diretos já registrados como indisponíveis
 ```
 
 ## Como interpretar indisponíveis
 
 No relatório, uma gravação com `statusCode` 200 e motivo `resposta 200 sem temporaryDirectDownloadLinks.recordingDownloadLink` existe na API, mas não possui link direto de download disponível para o token atual. Os metadados `playbackUrl`, `downloadUrl`, `sizeBytes`, `format` e `status`, quando retornados pela API, ajudam a diferenciar restrição de download, gravação sem mídia ou política aplicada no Webex.
+
+Durante a pré-checagem, esses casos são salvos incrementalmente no `download_state.json` em `availability_unavailable` e o `download_availability_report.json` é atualizado ao longo do processo. Se o script for interrompido antes do fim, uma nova execução reutiliza esse registro e não consulta novamente essas gravações, a menos que `--recheck-unavailable` seja informado.

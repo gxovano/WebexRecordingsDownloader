@@ -30,6 +30,8 @@ DEFAULT_THREADS = 4
 DETAIL_RESPONSE_PREVIEW_CHARS = 2000
 DETAIL_RETRY_ATTEMPTS = 3
 DOWNLOAD_RETRY_ATTEMPTS = 3
+UNAVAILABLE_CACHE_KEY = "availability_unavailable"
+DIRECT_LINK_UNAVAILABLE_REASON = "Link direto indisponivel"
 
 
 @dataclass
@@ -148,10 +150,85 @@ def build_unavailable(recording, response, reason, metadata=None):
     )
 
 
-def precheck_recordings(rows, headers, download_dir, state, skip_existing=True):
+def is_direct_link_unavailable_reason(reason):
+    return DIRECT_LINK_UNAVAILABLE_REASON in str(reason or '')
+
+
+def cache_timestamp():
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+
+def build_recording_from_cached_unavailable(row, account_dir, entry):
+    recording_id = row[0]
+    host_email = row[1]
+    topic = entry.get("topic") or (row[2] if len(row) > 2 else '')
+    time_recorded = entry.get("timeRecorded") or (row[3] if len(row) > 3 else '')
+    try:
+        status_code = int(entry.get("statusCode") or 0)
+    except (TypeError, ValueError):
+        status_code = 0
+    return CheckedRecording(
+        row=row,
+        recording_id=recording_id,
+        host_email=entry.get("hostEmail") or host_email,
+        account_dir=account_dir,
+        topic=topic,
+        time_recorded=time_recorded,
+        status_code=status_code,
+        reason=entry.get("reason") or entry.get("error") or "Link direto indisponivel registrado no estado.",
+        metadata=entry.get("metadata") or {},
+    )
+
+
+def get_cached_unavailable(state, recording_id):
+    data = state.load()
+    entry = data.get(UNAVAILABLE_CACHE_KEY, {}).get(recording_id)
+    if entry:
+        return entry
+
+    # Compatibilidade com estados gravados antes do cache explicito da v3.
+    failed_entry = data.get("failed", {}).get(recording_id, {})
+    failed_reason = failed_entry.get("error", '')
+    if is_direct_link_unavailable_reason(failed_reason):
+        return {
+            "recordingId": recording_id,
+            "statusCode": 0,
+            "reason": failed_reason,
+            "metadata": {"source": "download_state.failed"},
+        }
+    return None
+
+
+def remember_unavailable(state, recording):
+    if not is_direct_link_unavailable_reason(recording.reason):
+        return
+    entry = recording.to_report_entry()
+    entry["cachedAt"] = cache_timestamp()
+    with state._locked() as data:
+        data.setdefault(UNAVAILABLE_CACHE_KEY, {})[recording.recording_id] = entry
+
+
+def forget_unavailable(state, recording_id):
+    with state._locked() as data:
+        data.setdefault(UNAVAILABLE_CACHE_KEY, {}).pop(recording_id, None)
+
+
+def precheck_recordings(
+    rows,
+    headers,
+    download_dir,
+    state,
+    skip_existing=True,
+    skip_cached_unavailable=True,
+    progress_callback=None,
+):
     available = []
     unavailable = []
     already_completed = []
+
+    def report_progress():
+        if progress_callback:
+            progress_callback(available, unavailable, already_completed)
 
     for index, row in enumerate(rows, start=1):
         recording_id = row[0]
@@ -173,6 +250,7 @@ def precheck_recordings(rows, headers, download_dir, state, skip_existing=True):
         if skip_existing and state.is_completed(recording_id):
             print(f"[{index}/{len(rows)}] Ja concluida no estado, pulando: {recording_id}")
             already_completed.append(base_recording)
+            report_progress()
             continue
 
         if skip_existing:
@@ -187,7 +265,19 @@ def precheck_recordings(rows, headers, download_dir, state, skip_existing=True):
             if existing_path:
                 print(f"[{index}/{len(rows)}] Arquivo ja existe, registrando como concluida: {existing_path}")
                 state.mark_completed(recording_id, existing_path)
+                forget_unavailable(state, recording_id)
                 already_completed.append(base_recording)
+                report_progress()
+                continue
+
+        if skip_cached_unavailable:
+            cached_unavailable = get_cached_unavailable(state, recording_id)
+            if cached_unavailable:
+                cached_recording = build_recording_from_cached_unavailable(row, account_dir, cached_unavailable)
+                print(f"[{index}/{len(rows)}] Link indisponivel ja registrado, pulando consulta: {recording_id}")
+                remember_unavailable(state, cached_recording)
+                unavailable.append(cached_recording)
+                report_progress()
                 continue
 
         print(f"[{index}/{len(rows)}] Verificando link: {recording_id}, HostEmail: {host_email}")
@@ -198,6 +288,7 @@ def precheck_recordings(rows, headers, download_dir, state, skip_existing=True):
             print(reason)
             state.mark_failed(recording_id, reason)
             unavailable.append(build_unavailable(base_recording, None, reason))
+            report_progress()
             continue
 
         try:
@@ -208,6 +299,7 @@ def precheck_recordings(rows, headers, download_dir, state, skip_existing=True):
             print(reason)
             state.mark_failed(recording_id, reason)
             unavailable.append(build_unavailable(base_recording, response, reason, metadata))
+            report_progress()
             continue
 
         metadata = summarize_api_response(details)
@@ -226,6 +318,7 @@ def precheck_recordings(rows, headers, download_dir, state, skip_existing=True):
             print(reason)
             state.mark_failed(recording_id, reason)
             unavailable.append(build_unavailable(base_recording, response, reason, metadata))
+            report_progress()
             continue
 
         links = details.get('temporaryDirectDownloadLinks') or {}
@@ -234,12 +327,17 @@ def precheck_recordings(rows, headers, download_dir, state, skip_existing=True):
             reason = "Link direto indisponivel: resposta 200 sem temporaryDirectDownloadLinks.recordingDownloadLink."
             print(reason)
             state.mark_failed(recording_id, reason)
-            unavailable.append(build_unavailable(base_recording, response, reason, metadata))
+            unavailable_recording = build_unavailable(base_recording, response, reason, metadata)
+            remember_unavailable(state, unavailable_recording)
+            unavailable.append(unavailable_recording)
+            report_progress()
             continue
 
+        forget_unavailable(state, recording_id)
         base_recording.download_link = recording_download_link
         base_recording.reason = "Disponivel para download."
         available.append(base_recording)
+        report_progress()
 
     return available, unavailable, already_completed, headers
 
@@ -290,6 +388,7 @@ def download_checked_recording(recording, state, min_free_bytes=None, skip_exist
                 )
                 if skip_existing and existing_path:
                     state.mark_completed(recording_id, existing_path)
+                    forget_unavailable(state, recording_id)
                     return {
                         "recordingId": recording_id,
                         "status": "skipped",
@@ -305,6 +404,7 @@ def download_checked_recording(recording, state, min_free_bytes=None, skip_exist
                     min_free_bytes=min_free_bytes,
                 )
                 state.mark_completed(recording_id, target_path)
+                forget_unavailable(state, recording_id)
                 return {"recordingId": recording_id, "status": "downloaded", "path": target_path}
 
         error = f"Download falhou apos {DOWNLOAD_RETRY_ATTEMPTS} tentativas."
@@ -318,9 +418,10 @@ def download_checked_recording(recording, state, min_free_bytes=None, skip_exist
         return {"recordingId": recording_id, "status": "failed", "reason": str(exc)}
 
 
-def write_report(report_file, summary, available, unavailable, already_completed, download_results=None):
+def write_report(report_file, summary, available, unavailable, already_completed, download_results=None, announce=True):
     report_path = Path(report_file)
     report_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_report_path = report_path.with_suffix(report_path.suffix + ".tmp")
     download_results = download_results or []
     report = {
         "summary": summary,
@@ -329,10 +430,12 @@ def write_report(report_file, summary, available, unavailable, already_completed
         "alreadyCompleted": [recording.to_report_entry() for recording in already_completed],
         "downloads": download_results,
     }
-    with open(report_path, 'w', encoding='utf-8') as handle:
+    with open(temp_report_path, 'w', encoding='utf-8') as handle:
         json.dump(report, handle, indent=2, ensure_ascii=False)
         handle.write('\n')
-    print(f"Relatorio gravado em: {report_path}")
+    os.replace(temp_report_path, report_path)
+    if announce:
+        print(f"Relatorio gravado em: {report_path}")
 
 
 def download_available_recordings(available, threads, state, min_free_bytes=None, skip_existing=True):
@@ -380,7 +483,18 @@ def build_summary(rows, available, unavailable, already_completed, download_resu
     }
 
 
-def run(headers, csv_path, download_dir, threads, state_file, report_file, min_free_bytes, skip_existing=True, check_only=False):
+def run(
+    headers,
+    csv_path,
+    download_dir,
+    threads,
+    state_file,
+    report_file,
+    min_free_bytes,
+    skip_existing=True,
+    check_only=False,
+    recheck_unavailable=False,
+):
     csv_path = Path(csv_path)
     download_dir = str(download_dir)
     state = DownloadState(state_file)
@@ -395,12 +509,18 @@ def run(headers, csv_path, download_dir, threads, state_file, report_file, min_f
     print(f"Arquivo de estado: {state_file}")
     print_disk_status(download_dir, min_free_bytes)
 
+    def write_precheck_progress(available, unavailable, already_completed):
+        summary = build_summary(rows, available, unavailable, already_completed)
+        write_report(report_file, summary, available, unavailable, already_completed, announce=False)
+
     available, unavailable, already_completed, headers = precheck_recordings(
         rows,
         headers,
         download_dir,
         state,
         skip_existing=skip_existing,
+        skip_cached_unavailable=not recheck_unavailable,
+        progress_callback=write_precheck_progress,
     )
 
     download_results = []
@@ -468,6 +588,11 @@ def build_arg_parser():
         action='store_true',
         help='Executa apenas a pre-checagem e grava o relatorio, sem baixar arquivos.',
     )
+    parser.add_argument(
+        '--recheck-unavailable',
+        action='store_true',
+        help='Consulta novamente gravacoes com link direto indisponivel ja registrado no estado.',
+    )
     return parser
 
 
@@ -488,6 +613,7 @@ def main():
         min_free_bytes=min_free_bytes,
         skip_existing=not args.no_skip_existing,
         check_only=args.check_only,
+        recheck_unavailable=args.recheck_unavailable,
     )
 
 
